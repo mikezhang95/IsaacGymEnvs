@@ -54,6 +54,9 @@ import numpy as np
 # Dimensions of robot #
 # ################### #
 
+# M: for multi-agent, local observations: rotate local coordinate system by local z axis for 0, 120, 240 degrees
+# w = cos(a/2), z=sin(a/2)
+FINGER_QUATS = torch.tensor([[1,0,0,0],[0.5,0,0,0.866], [-0.5,0,0,0.866]])
 
 class TrifingerDimensions(enum.Enum):
     """
@@ -348,8 +351,18 @@ class Trifinger(VecTask):
             "command":  self.action_dim
         }
 
-        self.cfg["env"]["numObservations"] = sum(self.obs_spec.values())
-        self.cfg["env"]["numStates"] = sum(self.state_spec.values())
+        # M: multi-agent observation, only applies to asymmetric_obs=False
+        if "ma_obs" in self.cfg["env"] and self.cfg["env"]["ma_obs"]:
+            self.cfg["env"]["numObservations"] = 41 * 3 # 23 * 3 
+            if self.cfg["env"]["enable_ft_sensors"] or self.cfg["env"]["asymmetric_obs"]:
+            
+                self.cfg["env"]["numStates"] = 42 * 3
+            else:
+                self.cfg["env"]["numStates"] = 41 * 3 # 23 * 3
+
+        else:
+            self.cfg["env"]["numObservations"] = sum(self.obs_spec.values())
+            self.cfg["env"]["numStates"] = sum(self.state_spec.values())
         self.cfg["env"]["numActions"] = sum(self.action_spec.values())
         self.max_episode_length = self.cfg["env"]["episodeLength"]
         self.randomize = self.cfg["task"]["randomize"]
@@ -781,6 +794,98 @@ class Trifinger(VecTask):
                 upper=self._observations_scale.high
             )
 
+    def compute_observations_ma(self):
+        # refresh memory buffers
+        self.gym.refresh_dof_state_tensor(self.sim)
+        self.gym.refresh_actor_root_state_tensor(self.sim)
+        self.gym.refresh_rigid_body_state_tensor(self.sim)
+
+        if self.cfg["env"]["enable_ft_sensors"] or self.cfg["env"]["asymmetric_obs"]:
+            self.gym.refresh_dof_force_tensor(self.sim)
+            self.gym.refresh_force_sensor_tensor(self.sim)
+            joint_torques = self._dof_torque
+            tip_wrenches = self._ft_sensors_values
+
+        else:
+            joint_torques = torch.zeros(self.num_envs, self._dims.JointTorqueDim.value, dtype=torch.float32, device=self.device)
+            tip_wrenches = torch.zeros(self.num_envs, self._dims.NumFingers.value * self._dims.WrenchDim.value, dtype=torch.float32, device=self.device)
+
+        # extract frame handles
+        fingertip_handles_indices = list(self._fingertips_handles.values())
+        object_indices = self.gym_indices["object"]
+        # update state histories
+        self._fingertips_frames_state_history.appendleft(self._rigid_body_state[:, fingertip_handles_indices])
+        self._object_state_history.appendleft(self._actors_root_state[object_indices])
+        # fill the observations and states buffer
+
+        joint_obses, joint_states = compute_trifinger_observations_states(
+            self.cfg["env"]["asymmetric_obs"],
+            self._dof_position,
+            self._dof_velocity,
+            self._object_state_history[0],
+            self._object_goal_poses_buf,
+            self.actions,
+            self._fingertips_frames_state_history[0],
+            joint_torques,
+            tip_wrenches,
+        )
+
+        # normalize observations if flag is enabled
+        if self.cfg["env"]["normalize_obs"]:
+            # for normal obs
+            joint_obses = scale_transform(
+                joint_obses,
+                lower=self._observations_scale.low,
+                upper=self._observations_scale.high
+            )
+
+        
+        # M: Multi-agent setup
+        ma_obses, ma_states = [], []
+        for i in range(3):
+            # transfer object to local coordinate
+            finger_quat = FINGER_QUATS[i].to(joint_obses.device).unsqueeze(0).repeat(joint_obses.shape[0], 1)
+            object_p, object_o, goal_p, goal_o = joint_obses[:, 18:21], joint_obses[:, 21:25], joint_obses[:, 25:28], joint_obses[:, 28:32]
+            object_p = quat_rotate_inverse(finger_quat, object_p)
+            object_o = quat_mul(quat_conjugate(finger_quat), object_o)
+            goal_p = quat_rotate_inverse(finger_quat, goal_p)
+            goal_o = quat_mul(quat_conjugate(finger_quat), goal_o)
+
+            obs = torch.cat([
+                joint_obses[:, i*3:(i+1)*3],  # position (in finger's view)
+                joint_obses[:, i*3+9:(i+1)*3+9],  # velocity (in finger's view)
+                joint_obses[:, ((i+1)%3)*3:((i+1)%3)*3+3],  # position (in finger's view)
+                joint_obses[:, ((i+1)%3)*3+9:((i+1)%3)*3+3+9],  # velocity (in finger's view)
+                joint_obses[:, ((i+2)%3)*3:((i+2)%3)*3+3],  # position (in finger's view)
+                joint_obses[:, ((i+2)%3)*3+9:((i+2)%3)*3+3+9],  # velocity (in finger's view)
+                object_p,
+                object_o,
+                goal_p,
+                goal_o,
+                joint_obses[:, i*3+32:(i+1)*3+32], # last_action (in finger's view)
+                joint_obses[:, ((i+1)%3)*3+32:((i+1)%3)*3+3+32],  # velocity (in finger's view)
+                joint_obses[:, ((i+2)%3)*3+32:((i+2)%3)*3+3+32],  # velocity (in finger's view)
+            ], dim=-1)
+            ma_obses.append(obs)
+        ma_obses = torch.stack(ma_obses, dim=1) # [batch_size, num_agents, obs_dim]
+
+        if self.cfg["env"]["enable_ft_sensors"] or self.cfg["env"]["asymmetric_obs"]:
+            for i in range(3):
+                state = torch.cat([
+                    ma_obses[:, i, :], # observation
+                    joint_states[:, 41:47], #  object velocity
+                    joint_states[:, 47+i*7:47+(i+1)*7], # fingertip position + velocity
+                    joint_states[:, 86+i*3:86+(i+1)*3], # joint torque
+                    joint_states[:, 95+i*3:95+(i+1)*3], # fintertip wrench
+                ], dim=-1)
+                ma_states.append(state)
+            ma_states = torch.stack(ma_states, dim=1) # [batch_size, num_agents, state_dim]
+        else:
+            ma_states = ma_obses
+        ma_obses = ma_obses.view(ma_obses.shape[0], -1)
+        ma_states = ma_states.view(ma_states.shape[0], -1)
+        self.obs_buf[:], self.states_buf[:] = ma_obses, ma_states
+
     def reset_idx(self, env_ids):
 
         # randomization can happen only at reset time, since it can reset actor positions on GPU
@@ -1050,7 +1155,11 @@ class Trifinger(VecTask):
         self.progress_buf += 1
         self.randomize_buf += 1
 
-        self.compute_observations()
+        # M: for multi-agent
+        if "ma_obs" in self.cfg["env"] and self.cfg["env"]["ma_obs"]:
+            self.compute_observations_ma()
+        else:
+            self.compute_observations()
         self.compute_reward(self.actions)
 
         # check termination conditions (success only)
@@ -1377,7 +1486,7 @@ def compute_trifinger_reward(
     info: Dict[str, torch.Tensor] = {
         'finger_movement_penalty': finger_movement_penalty,
         'finger_reach_object_reward': finger_reach_object_reward,
-        'pose_reward': finger_reach_object_reward,
+        'pose_reward': pose_reward, 
         'reward': total_reward,
     }
 
