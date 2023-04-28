@@ -30,6 +30,9 @@ env:
   resetDofPosRandomInterval: 0.2
   resetDofVelRandomInterval: 0.0
 
+  startObjectPoseDY: -0.19
+  startObjectPoseDZ: 0.06
+
   # Random forces applied to the object
   forceScale: 0.0
   forceProbRange: [0.001, 0.1]
